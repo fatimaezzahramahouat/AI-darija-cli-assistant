@@ -21,6 +21,15 @@ import {
   powerShellProfilePath,
   readCapture,
 } from '../src/session.js';
+import { childEnvironment } from '../src/env.js';
+import { MAX_DIFF_CHARS, readStagedChanges, runGit } from '../src/git.js';
+import { highlightScript } from '../src/highlight.js';
+import {
+  ensureShebang,
+  saveScript,
+  scriptPathFor,
+  scriptRunner,
+} from '../src/script.js';
 import { printBanner, riskLabel, SPINNER_TEXT } from '../src/ui.js';
 
 const packageJson = JSON.parse(
@@ -28,11 +37,13 @@ const packageJson = JSON.parse(
 );
 
 const API_TIMEOUT_MS = readTimeout();
+const LOCAL_TIMEOUT_MS = 120_000;
 const RISK_RANK = { low: 0, medium: 1, high: 2 };
 
 const PROVIDERS = {
   openai: {
     id: 'openai',
+    kind: 'remote',
     label: 'OpenAI',
     baseURL: 'https://api.openai.com/v1',
     defaultModel: 'gpt-4o-mini',
@@ -42,6 +53,7 @@ const PROVIDERS = {
   },
   groq: {
     id: 'groq',
+    kind: 'remote',
     label: 'Groq',
     baseURL: 'https://api.groq.com/openai/v1',
     defaultModel: 'openai/gpt-oss-120b',
@@ -49,7 +61,19 @@ const PROVIDERS = {
     modelEnv: 'GROQ_MODEL',
     keyPattern: /^gsk_[A-Za-z0-9_-]+$/,
   },
+  ollama: {
+    id: 'ollama',
+    kind: 'local',
+    label: 'Ollama',
+    baseURL: 'http://localhost:11434/v1',
+    defaultModel: 'llama3',
+    keyEnv: null,
+    modelEnv: 'OLLAMA_MODEL',
+    keyPattern: null,
+  },
 };
+
+const REMOTE_PROVIDER_IDS = Object.keys(PROVIDERS).filter((id) => PROVIDERS[id].kind === 'remote');
 
 const RESPONSE_FORMAT = {
   type: 'json_schema',
@@ -117,6 +141,43 @@ const FIX_FORMAT = {
         requires_confirmation: { type: 'boolean' },
       },
       required: ['diagnosis', 'command', 'explanation', 'risk_level', 'requires_confirmation'],
+    },
+  },
+};
+
+const COMMIT_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'commit_message',
+    description: 'One Conventional Commits message for a staged Git diff.',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        message: { type: 'string' },
+      },
+      required: ['message'],
+    },
+  },
+};
+
+const SCRIPT_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'shell_script',
+    description: 'One complete OS-specific shell script for a natural-language task.',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        script: { type: 'string' },
+        explanation: { type: 'string' },
+        risk_level: { type: 'string', enum: ['low', 'medium', 'high'] },
+        requires_confirmation: { type: 'boolean' },
+      },
+      required: ['script', 'explanation', 'risk_level', 'requires_confirmation'],
     },
   },
 };
@@ -323,7 +384,9 @@ export function resolveApiKey(env = process.env, store = getStore()) {
     return { key, provider: providerForKey(key) ?? 'openai', source: 'saved key' };
   }
   const preferred = env.DARIJA_PROVIDER?.trim().toLowerCase();
-  const order = PROVIDERS[preferred] ? [preferred, ...Object.keys(PROVIDERS).filter((id) => id !== preferred)] : Object.keys(PROVIDERS);
+  const order = REMOTE_PROVIDER_IDS.includes(preferred)
+    ? [preferred, ...REMOTE_PROVIDER_IDS.filter((id) => id !== preferred)]
+    : REMOTE_PROVIDER_IDS;
   for (const id of order) {
     const fromEnv = env[PROVIDERS[id].keyEnv]?.trim();
     if (fromEnv) return { key: fromEnv, provider: id, source: PROVIDERS[id].keyEnv };
@@ -418,6 +481,37 @@ function fixPrompt(profile) {
     'Never propose destructive actions, force pushes, recursive deletes, or unrelated chained commands.',
     'Set risk_level and requires_confirmation exactly as a careful engineer would.',
     'Respond with one JSON object that has diagnosis, command, explanation, risk_level, and requires_confirmation.',
+  ].join('\n');
+}
+
+function commitPrompt() {
+  return [
+    'You write Git commit messages for a senior engineer.',
+    'You receive the staged file summary and the staged diff of one repository.',
+    'Return one Conventional Commits message: type(scope): subject.',
+    'Use feat, fix, docs, style, refactor, perf, test, build, ci, chore, or revert as the type, and add a scope only when it is obvious from the diff.',
+    'Write the subject in the imperative mood, lowercase unless a proper noun, no trailing period, and at most 72 characters.',
+    'Add a short body after one blank line only when the change needs context, wrapped at 72 characters, explaining what changed and why.',
+    'Never invent files or behavior that the diff does not show, and never include secrets, tokens, or keys.',
+    'Do not wrap the message in code fences and do not prefix it with "git commit".',
+    'Respond with one JSON object that has a single field, message.',
+  ].join('\n');
+}
+
+function scriptPrompt(profile) {
+  const language = profile.platform === 'win32' ? 'PowerShell' : 'bash';
+  return [
+    'You are a senior Moroccan developer who writes small, careful shell scripts.',
+    `Write one complete ${language} script for ${profile.osName} that performs the requested task.`,
+    profile.guidance,
+    'Print a short progress line before each meaningful step so the user can follow the run.',
+    'Prefer non-interactive flags and idempotent steps, and fail early when a required tool or file is missing.',
+    'Keep every path and value explicit: define variables at the top instead of leaving placeholders such as <REPO> or YOUR_NAME.',
+    'Never include credential handling, disk formatting, recursive deletes of system paths, sudo, or downloads piped into a shell.',
+    'Keep the script under 80 lines, with comments only where the intent is not obvious.',
+    'Write the explanation in the same language and script as the request, in one or two short sentences.',
+    'Set risk_level to low for read-only scripts, medium for ordinary local changes, and high for deletion, reset, prune, or anything hard to undo.',
+    'Respond with one JSON object that has script, explanation, risk_level, and requires_confirmation.',
   ].join('\n');
 }
 
@@ -827,12 +921,6 @@ export function describePlan(plan) {
   return 'Runs in /bin/sh as one confirmed command.';
 }
 
-function childEnvironment() {
-  const env = { ...process.env };
-  for (const provider of Object.values(PROVIDERS)) delete env[provider.keyEnv];
-  return env;
-}
-
 function stopChild(child, force = false) {
   if (!child?.pid) return;
   try {
@@ -849,10 +937,15 @@ export function runPlannedCommand(command, platform = process.platform) {
   if (block) return Promise.reject(new Error(`Refusing to run this command (${block}).`));
 
   const plan = executionPlan(command, platform);
+  return runChildProcess(plan.file, plan.args);
+}
+
+function runChildProcess(file, args, { cwd = process.cwd() } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     interrupted = false;
-    const child = spawn(plan.file, plan.args, {
+    const child = spawn(file, args, {
+      cwd,
       stdio: 'inherit',
       windowsHide: true,
       shell: false,
@@ -869,7 +962,7 @@ export function runPlannedCommand(command, platform = process.platform) {
 
     child.once('error', (error) => {
       if (error?.code === 'ENOENT') {
-        finish(reject, new Error(`Could not find ${plan.file}. Install it and make sure it is on PATH.`));
+        finish(reject, new Error(`Could not find ${file}. Install it and make sure it is on PATH.`));
         return;
       }
       finish(reject, error);
@@ -976,6 +1069,49 @@ function normalizeFix(value) {
   };
 }
 
+function stripCodeFence(text) {
+  const trimmed = String(text ?? '').trim();
+  const fenced = trimmed.match(/^```[A-Za-z0-9_-]*\s*\n?([\s\S]*?)\n?```$/);
+  return fenced ? fenced[1].trim() : trimmed;
+}
+
+function normalizeCommit(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ResponseParseError('The model response was not a JSON object.');
+  }
+  let message = typeof value.message === 'string' ? value.message : '';
+  message = stripCodeFence(sanitizeTerminal(message).replace(/\r\n?/g, '\n')).trim();
+  const wrapped = message.match(/^git\s+commit\s+-m\s+(["'])([\s\S]*)\1$/i);
+  if (wrapped) message = wrapped[2].trim();
+  if (!message) throw new ResponseParseError('The model returned an empty commit message.');
+  if (message.length > 2000) throw new ResponseParseError('The commit message was too long.');
+  const subject = message.split('\n')[0];
+  if (subject.length > 100) throw new ResponseParseError('The commit subject was too long.');
+  return { message };
+}
+
+function normalizeScript(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ResponseParseError('The model response was not a JSON object.');
+  }
+  const raw = typeof value.script === 'string' ? value.script : '';
+  const script = stripCodeFence(sanitizeTerminal(raw.replace(/\r\n?/g, '\n'))).trim();
+  if (!script) throw new ResponseParseError('The model returned an empty script.');
+  if (script.length > 20_000) throw new ResponseParseError('The script was too long.');
+  const explanation = typeof value.explanation === 'string'
+    ? sanitizeTerminal(value.explanation).replace(/\s+/g, ' ').trim()
+    : '';
+  if (!explanation) throw new ResponseParseError('The model omitted the explanation.');
+  if (explanation.length > 1200) throw new ResponseParseError('The explanation was too long.');
+  const { risk, requires_confirmation } = readRisk(value);
+  return {
+    script,
+    explanation,
+    risk_level: risk,
+    requires_confirmation,
+  };
+}
+
 function schemaUnsupported(error) {
   if (error?.status !== 400) return false;
   return /response_format|json_schema|structured/i.test(String(error.message ?? ''));
@@ -1029,11 +1165,19 @@ async function requestStructured(client, model, messages, { responseFormat, norm
   throw new ResponseParseError('The model could not produce a valid response.');
 }
 
+function timeoutFor(provider) {
+  if (provider?.kind === 'local' && !process.env.OPENAI_TIMEOUT_MS) return LOCAL_TIMEOUT_MS;
+  return API_TIMEOUT_MS;
+}
+
 function createClient(apiKey, provider) {
+  const baseURL = provider.kind === 'local'
+    ? (process.env.DARIJA_OLLAMA_URL?.trim() || provider.baseURL)
+    : (process.env.DARIJA_BASE_URL?.trim() || provider.baseURL);
   return new OpenAI({
-    apiKey,
-    baseURL: process.env.DARIJA_BASE_URL?.trim() || provider.baseURL,
-    timeout: API_TIMEOUT_MS,
+    apiKey: apiKey || 'darija-local',
+    baseURL,
+    timeout: timeoutFor(provider),
     maxRetries: 0,
   });
 }
@@ -1088,23 +1232,66 @@ async function suggestFix(captured, apiKey, profile, model, provider) {
   });
 }
 
+async function generateCommitMessage(staged, apiKey, model, provider) {
+  const diff = staged.diff.length > MAX_DIFF_CHARS
+    ? `${staged.diff.slice(0, MAX_DIFF_CHARS)}\n\n[diff truncated: ${staged.diff.length - MAX_DIFF_CHARS} characters omitted]`
+    : staged.diff;
+  const messages = [
+    { role: 'system', content: commitPrompt() },
+    {
+      role: 'user',
+      content: `Staged files:\n${staged.stat || '(none)'}\n\nStaged diff:\n${diff}`,
+    },
+  ];
+  return requestStructured(createClient(apiKey, provider), model, messages, {
+    responseFormat: COMMIT_FORMAT,
+    normalize: normalizeCommit,
+    maxTokens: 600,
+  });
+}
+
+async function generateScript(task, apiKey, profile, model, provider) {
+  const messages = [
+    { role: 'system', content: scriptPrompt(profile) },
+    { role: 'user', content: `Task: ${task}` },
+  ];
+  return requestStructured(createClient(apiKey, provider), model, messages, {
+    responseFormat: SCRIPT_FORMAT,
+    normalize: normalizeScript,
+    maxTokens: 2000,
+  });
+}
+
 function formatApiError(error, apiKey, provider) {
   const label = provider?.label ?? 'API';
   const keyEnv = provider?.keyEnv ?? 'OPENAI_API_KEY';
   const modelEnv = provider?.modelEnv ?? 'OPENAI_MODEL';
   const status = error?.status;
   const code = error?.code ?? error?.error?.code;
+  const unreachable = code === 'ENOTFOUND'
+    || code === 'ECONNREFUSED'
+    || code === 'ECONNRESET'
+    || error?.name === 'APIConnectionError';
+  if (unreachable && provider?.kind === 'local') {
+    const baseURL = process.env.DARIJA_OLLAMA_URL?.trim() || provider.baseURL;
+    return `Could not reach Ollama at ${baseURL}. Start it with "ollama serve" and pull the model with "ollama pull ${provider.defaultModel}".`;
+  }
   if (code === 'insufficient_quota') {
     return `${label} reports no available quota for this account. Add credits or check the billing page.`;
   }
   if (status === 401) return `${label} rejected the API key. Check darija config or ${keyEnv}.`;
   if (status === 429) return `${label} rate limit reached. Wait a moment and try again.`;
-  if (status === 404) return `That model was not found. Set ${modelEnv} to a model your account can use.`;
+  if (status === 404) {
+    if (provider?.kind === 'local') {
+      return `Ollama does not have that model. Run "ollama pull <model>" or pass --model with a model you already pulled.`;
+    }
+    return `That model was not found. Set ${modelEnv} to a model your account can use.`;
+  }
   if (status === 403) return `${label} refused this request. The key may lack access to that model.`;
   if (error?.name === 'APIConnectionTimeoutError' || error?.code === 'ETIMEDOUT' || error?.code === 'ABORT_ERR') {
-    return `The ${label} request timed out after ${API_TIMEOUT_MS}ms.`;
+    return `The ${label} request timed out after ${timeoutFor(provider)}ms.`;
   }
-  if (error?.code === 'ENOTFOUND' || error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET') {
+  if (unreachable) {
     return `Could not reach the ${label} API. Check the network connection.`;
   }
   return sanitizeTerminal(redact(error?.message || `The ${label} request failed.`, apiKey));
@@ -1202,10 +1389,10 @@ async function promptAction(verdict) {
   }
 }
 
-async function confirmExecution(verdict) {
+async function confirmExecution(verdict, noun = 'command') {
   if (verdict.risk_level === 'high') {
     console.log(chalk.red.bold('\nAdditional confirmation'));
-    console.log(chalk.red(`This is a high-risk command (${verdict.reason}).`));
+    console.log(chalk.red(`This is a high-risk ${noun} (${verdict.reason}).`));
     const answer = await ask([
       {
         type: 'input',
@@ -1221,7 +1408,7 @@ async function confirmExecution(verdict) {
       type: 'confirm',
       name: 'ok',
       default: false,
-      message: 'Run this command?',
+      message: `Run this ${noun}?`,
     },
   ]);
   return answer.ok === true;
@@ -1279,7 +1466,22 @@ async function handleAction(action, payload, verdict, apiKey) {
   process.exitCode = code || 1;
 }
 
-function loadProviderSession() {
+function llmOptions(options = {}) {
+  const root = program.opts();
+  return {
+    local: Boolean(options.local || root.local),
+    model: options.model || root.model,
+  };
+}
+
+function loadProviderSession(options = {}) {
+  if (options.local) {
+    return {
+      resolved: { key: '', provider: 'ollama', source: 'local Ollama' },
+      provider: PROVIDERS.ollama,
+    };
+  }
+
   let resolved;
   try {
     resolved = resolveApiKey();
@@ -1292,7 +1494,7 @@ function loadProviderSession() {
   }
   if (!resolved) {
     console.error(chalk.red('No API key is configured.'));
-    console.error(chalk.dim('Save one with darija config --key <API_KEY>, or set OPENAI_API_KEY or GROQ_API_KEY.'));
+    console.error(chalk.dim('Save one with darija config --key <API_KEY>, set OPENAI_API_KEY or GROQ_API_KEY, or use --local with Ollama.'));
     process.exitCode = 1;
     return null;
   }
@@ -1339,7 +1541,7 @@ function printDiagnosis(captured, result, providerLabel, model) {
   }
 }
 
-async function runExplain(parts) {
+async function runExplain(parts, options = {}) {
   const command = parts.join(' ').trim();
   if (!command) {
     console.error(chalk.red('Give me a command to explain, for example: darija chra7 "git reset --hard"'));
@@ -1361,10 +1563,11 @@ async function runExplain(parts) {
     return;
   }
 
-  const session = loadProviderSession();
+  const settings = llmOptions(options);
+  const session = loadProviderSession(settings);
   if (!session) return;
   const { resolved, provider } = session;
-  const model = selectedModel(provider);
+  const model = selectedModel(provider, settings);
 
   printBanner();
   console.log(chalk.bold.cyan('darija chra7') + chalk.dim(`  ${profile.osName} · ${profile.shell} · ${provider.label}`));
@@ -1384,7 +1587,7 @@ async function runExplain(parts) {
   printExplanation(command, result, provider.label, model);
 }
 
-async function runFix(parts) {
+async function runFix(parts, options = {}) {
   const profile = environmentProfile();
   if (!profile) {
     console.error(chalk.red(`Unsupported operating system: ${os.platform()}. darija supports Windows, Linux, and macOS.`));
@@ -1405,10 +1608,11 @@ async function runFix(parts) {
     return;
   }
 
-  const session = loadProviderSession();
+  const settings = llmOptions(options);
+  const session = loadProviderSession(settings);
   if (!session) return;
   const { resolved, provider } = session;
-  const model = selectedModel(provider);
+  const model = selectedModel(provider, settings);
 
   printBanner();
   console.log(chalk.bold.cyan('darija 3ta9') + chalk.dim(`  ${profile.osName} · ${profile.shell} · ${provider.label}`));
@@ -1443,6 +1647,242 @@ async function runFix(parts) {
 
   const action = await promptAction(verdict);
   await handleAction(action, result, verdict, resolved.key);
+}
+
+function printStagedSummary(stat) {
+  const lines = sanitizeTerminal(stat).split('\n').filter(Boolean).slice(0, 20);
+  console.log(chalk.bold('Staged changes'));
+  console.log(chalk.dim(lines.map((line) => `  ${line}`).join('\n')));
+  console.log('');
+}
+
+function printCommitProposal(result) {
+  const [subject, ...body] = result.message.split('\n');
+  console.log(chalk.bold('Commit message'));
+  console.log(chalk.green(`  ${subject}`));
+  if (body.length) {
+    console.log(chalk.dim(body.map((line) => `  ${line}`).join('\n')));
+  }
+  console.log('');
+  console.log(chalk.bold('Risk'));
+  console.log(`  ${riskLabel('medium')} ${chalk.dim('· creates a local commit')}`);
+  console.log(chalk.dim('  The message is passed to git as one argument; no shell is involved.'));
+}
+
+async function runCommit(options = {}) {
+  let staged;
+  try {
+    staged = await readStagedChanges();
+  } catch (error) {
+    console.error(chalk.red(sanitizeTerminal(error?.message || 'Could not read the staged changes.')));
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!staged.staged) {
+    console.log(chalk.yellow('Ma3ndk walou staged.'));
+    console.log(chalk.dim('Stage the files first: git add <files>'));
+    console.log(chalk.dim('Then run darija commit again.'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const settings = llmOptions(options);
+  const session = loadProviderSession(settings);
+  if (!session) return;
+  const { resolved, provider } = session;
+  const model = selectedModel(provider, settings);
+
+  printBanner();
+  console.log(chalk.bold.cyan('darija commit') + chalk.dim(`  ${provider.label} ${sanitizeTerminal(model)}`));
+  printStagedSummary(staged.stat);
+
+  const spinner = ora({ text: SPINNER_TEXT, color: 'cyan' }).start();
+  let result;
+  try {
+    result = await generateCommitMessage(staged, resolved.key, model, provider);
+    spinner.succeed('Message wajed');
+  } catch (error) {
+    spinner.fail('Could not write a commit message');
+    console.error(chalk.red(formatApiError(error, resolved.key, provider)));
+    process.exitCode = 1;
+    return;
+  }
+
+  printCommitProposal(result);
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(chalk.yellow('\nAn interactive terminal is required before anything runs. Nothing was committed.'));
+    return;
+  }
+
+  const answer = await ask([
+    {
+      type: 'confirm',
+      name: 'ok',
+      default: false,
+      message: 'Commit b had l-message?',
+    },
+  ]);
+  if (!answer.ok) {
+    console.log(chalk.yellow('Cancelled. Nothing was committed.'));
+    return;
+  }
+
+  console.log(chalk.dim('\nCommitting...\n'));
+  let code;
+  try {
+    code = await runChildProcess('git', ['commit', '-m', result.message]);
+  } catch (error) {
+    console.error(chalk.red(sanitizeTerminal(error?.message || 'Could not run git commit.')));
+    process.exitCode = 1;
+    return;
+  }
+  if (code === 130) {
+    console.log(chalk.yellow('\nInterrupted. The commit was stopped.'));
+    process.exitCode = 130;
+    return;
+  }
+  if (code !== 0) {
+    console.error(chalk.red(`\ngit commit exited with code ${code}.`));
+    process.exitCode = code || 1;
+    return;
+  }
+
+  console.log(chalk.green('\nCommit done.'));
+  const head = await runGit(['log', '-1', '--oneline']);
+  if (head.code === 0 && head.stdout.trim()) {
+    console.log(chalk.dim(`  ${sanitizeTerminal(head.stdout.trim())}`));
+  }
+}
+
+function assessScript(script, assessment) {
+  const block = blockedReason(script);
+  if (block) {
+    return { ok: true, blocked: true, risk_level: 'high', requires_confirmation: true, reason: block };
+  }
+  const destructive = highRiskReason(script);
+  const modelRisk = RISK_RANK[assessment?.risk_level] === undefined ? 'medium' : assessment.risk_level;
+  return {
+    ok: true,
+    blocked: false,
+    risk_level: destructive ? 'high' : modelRisk,
+    requires_confirmation: true,
+    reason: destructive || (modelRisk === 'low' ? 'no destructive steps detected' : 'changes local state'),
+  };
+}
+
+function printScriptPreview(script, result, verdict, profile, providerLabel, model, runner) {
+  console.log(chalk.bold('Script') + (verdict.blocked ? chalk.dim('  (not saved)') : ''));
+  const lines = script.split('\n');
+  const shown = lines.slice(0, 100);
+  console.log(highlightScript(shown.join('\n'), profile.platform));
+  if (lines.length > shown.length) {
+    console.log(chalk.dim(`… ${lines.length - shown.length} more lines in the file`));
+  }
+  console.log('');
+  console.log(chalk.bold('Explanation'));
+  console.log(`  ${sanitizeTerminal(result.explanation)}`);
+  console.log('');
+  console.log(chalk.bold('Risk'));
+  console.log(`  ${riskLabel(verdict.risk_level)} ${chalk.dim(`· ${verdict.reason}`)}`);
+  console.log(chalk.dim(`  ${profile.osName} · ${runner.display} · ${providerLabel} ${sanitizeTerminal(model)}`));
+  if (verdict.blocked) {
+    console.log(chalk.red('\nThis script is blocked and will not be saved or executed.'));
+  }
+}
+
+async function runScript(parts, options = {}) {
+  const task = parts.join(' ').trim();
+  if (!task) {
+    console.error(chalk.red('Describe the script you want, for example: darija script "Back up every .env file in this repo"'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const profile = environmentProfile();
+  if (!profile) {
+    console.error(chalk.red(`Unsupported operating system: ${os.platform()}. darija supports Windows, Linux, and macOS.`));
+    process.exitCode = 1;
+    return;
+  }
+
+  const settings = llmOptions(options);
+  const session = loadProviderSession(settings);
+  if (!session) return;
+  const { resolved, provider } = session;
+  const model = selectedModel(provider, settings);
+
+  printBanner();
+  console.log(chalk.bold.cyan('darija script') + chalk.dim(`  ${profile.osName} · ${provider.label}`));
+  const spinner = ora({ text: SPINNER_TEXT, color: 'cyan' }).start();
+
+  let result;
+  try {
+    result = await generateScript(task, resolved.key, profile, model, provider);
+    spinner.succeed('Script wajed');
+  } catch (error) {
+    spinner.fail('Could not write the script');
+    console.error(chalk.red(formatApiError(error, resolved.key, provider)));
+    process.exitCode = 1;
+    return;
+  }
+
+  const script = ensureShebang(result.script, profile.platform);
+  const verdict = assessScript(script, result);
+  const target = scriptPathFor(process.cwd(), profile.platform);
+  const runner = scriptRunner(target, profile.platform, powershellExecutable());
+  const saved = verdict.blocked ? null : target;
+
+  console.log('');
+  if (saved) {
+    try {
+      saveScript(saved, script);
+      console.log(chalk.green(`Saved to ${sanitizeTerminal(saved)}`));
+    } catch (error) {
+      console.error(chalk.red(sanitizeTerminal(error?.message || 'Could not save the script.')));
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  printScriptPreview(script, result, verdict, profile, provider.label, model, runner);
+  if (verdict.blocked) {
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(chalk.yellow('\nAn interactive terminal is required before anything runs. Nothing was executed.'));
+    return;
+  }
+
+  const confirmed = await confirmExecution(verdict, 'script');
+  if (!confirmed) {
+    console.log(chalk.yellow('Cancelled. The script was saved but not executed.'));
+    return;
+  }
+
+  console.log(chalk.dim('\nRunning the script...\n'));
+  let code;
+  try {
+    code = await runChildProcess(runner.file, runner.args);
+  } catch (error) {
+    console.error(chalk.red(sanitizeTerminal(error?.message || 'Could not run the script.')));
+    process.exitCode = 1;
+    return;
+  }
+  if (code === 130) {
+    console.log(chalk.yellow('\nInterrupted. The script was stopped.'));
+    process.exitCode = 130;
+    return;
+  }
+  if (code !== 0) {
+    console.error(chalk.red(`\nThe script exited with code ${code}.`));
+    process.exitCode = code || 1;
+    return;
+  }
+  console.log(chalk.green('\nScript finished successfully.'));
 }
 
 async function runHook(options) {
@@ -1488,10 +1928,11 @@ async function runQuery(words, options) {
     return;
   }
 
-  const session = loadProviderSession();
+  const settings = llmOptions(options);
+  const session = loadProviderSession(settings);
   if (!session) return;
   const { resolved, provider } = session;
-  const model = selectedModel(provider, options);
+  const model = selectedModel(provider, settings);
 
   printBanner();
   console.log(chalk.bold.cyan('darija') + chalk.dim(`  ${profile.osName} · ${profile.shell} · ${provider.label}`));
@@ -1583,8 +2024,9 @@ function configure(options) {
 
   const saved = store.get('apiKey') ?? store.get('openaiApiKey');
   const active = resolveApiKey();
-  const envSummary = Object.values(PROVIDERS)
-    .map((provider) => {
+  const envSummary = REMOTE_PROVIDER_IDS
+    .map((id) => {
+      const provider = PROVIDERS[id];
       const value = process.env[provider.keyEnv]?.trim();
       return `${provider.keyEnv}: ${value ? maskSecret(value) : 'not set'}`;
     })
@@ -1593,22 +2035,32 @@ function configure(options) {
   const activeModel = activeProvider
     ? (process.env[activeProvider.modelEnv]?.trim() || activeProvider.defaultModel)
     : 'none';
+  const localModel = process.env.OLLAMA_MODEL?.trim() || PROVIDERS.ollama.defaultModel;
+  const localURL = process.env.DARIJA_OLLAMA_URL?.trim() || PROVIDERS.ollama.baseURL;
   console.log(`${chalk.bold('Provider')}   ${activeProvider ? activeProvider.label : chalk.dim('none')}`);
   console.log(`${chalk.bold('Saved key')}  ${typeof saved === 'string' && saved ? maskSecret(saved) : chalk.dim('not set')}`);
   console.log(`${chalk.bold('Env key')}    ${envSummary}`);
   console.log(`${chalk.bold('Active')}     ${active ? `${active.source} (${maskSecret(active.key)})` : chalk.red('none')}`);
   console.log(`${chalk.bold('Model')}      ${sanitizeTerminal(activeModel)}`);
+  console.log(`${chalk.bold('Local')}      ${chalk.dim(`Ollama ${sanitizeTerminal(localURL)} · ${sanitizeTerminal(localModel)} · use --local`)}`);
   console.log(`${chalk.bold('File')}       ${chalk.dim(sanitizeTerminal(store.path))}`);
 }
 
 const program = new Command();
+
+function withModelOptions(command) {
+  return command
+    .option('-l, --local', 'Use a local Ollama server (http://localhost:11434/v1) instead of OpenAI/Groq')
+    .option('-m, --model <name>', 'Model name (defaults to the provider default or the provider env var)');
+}
 
 program
   .name('darija')
   .description('Turn Moroccan Darija, French, or English into an OS-specific shell, Git, or Docker command.')
   .version(packageJson.version)
   .showHelpAfterError()
-  .option('-m, --model <name>', 'Model name (defaults to the provider default, or OPENAI_MODEL / GROQ_MODEL)')
+  .option('-m, --model <name>', 'Model name (defaults to the provider default, or OPENAI_MODEL / GROQ_MODEL / OLLAMA_MODEL)')
+  .option('-l, --local', 'Use a local Ollama server (http://localhost:11434/v1) instead of OpenAI/Groq')
   .argument('[request...]', 'Natural-language request')
   .action(async (request, options) => {
     await runQuery(request, options);
@@ -1619,8 +2071,11 @@ Examples:
   darija config --key gsk_...  (Groq)
   darija "Chno hiya branch li ana fiha daba?"
   darija "Create a new Git branch called feature/auth"
+  darija --local "Show the current Git branch"
   darija chra7 "git reset --hard HEAD~1"
   darija 3ta9
+  darija commit
+  darija script "Back up every .env file in this repo"
   darija hook --install
 `);
 
@@ -1631,20 +2086,35 @@ program
   .option('--clear', 'Delete the saved API key')
   .action(runConfig);
 
-program
-  .command('chra7')
+withModelOptions(program
+  .command('chra7'))
   .description('Explain a shell command line by line in Moroccan Darija')
   .argument('<command...>', 'Command to explain, quoted')
-  .action(async (command) => {
-    await runExplain(command);
+  .action(async (command, options) => {
+    await runExplain(command, options);
   });
 
-program
-  .command('3ta9')
+withModelOptions(program
+  .command('3ta9'))
   .description('Diagnose the last failed command and propose a safe fix in Darija')
   .argument('[error...]', 'Error output to diagnose when the shell hook is not installed')
-  .action(async (errorText) => {
-    await runFix(errorText);
+  .action(async (errorText, options) => {
+    await runFix(errorText, options);
+  });
+
+withModelOptions(program
+  .command('commit'))
+  .description('Read the staged diff and propose a Git commit message')
+  .action(async (options) => {
+    await runCommit(options);
+  });
+
+withModelOptions(program
+  .command('script'))
+  .description('Generate a multi-line shell script and offer to run it')
+  .argument('<prompt...>', 'What the script should do')
+  .action(async (prompt, options) => {
+    await runScript(prompt, options);
   });
 
 program

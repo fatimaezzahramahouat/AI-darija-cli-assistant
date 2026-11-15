@@ -16,6 +16,9 @@ darija config --key sk-...
 darija config --key gsk_...
 
 darija "Show the current Git branch"
+
+# or run fully local with Ollama, no key needed
+darija --local "Show the current Git branch"
 ```
 
 On Windows without `npm link` permissions, replace the last line with:
@@ -53,6 +56,49 @@ darija hook               # print the snippet instead
 
 Open a new PowerShell window after installing. The hook writes `last-error.json` next to the `darija` config file and only stores a failure when the last command failed. On macOS and Linux the hook is PowerShell-only; use the inline form, `darija 3ta9 "…error…"`.
 
+## Write a commit message: `darija commit`
+
+```bash
+git add src/auth.ts
+darija commit
+```
+
+`commit` reads `git diff --cached` (never the whole working tree), sends the staged summary and diff to the model, and prints a Conventional Commits message such as:
+
+```text
+feat(auth): refresh expired tokens before retrying
+
+Reuse the stored refresh token when the access token expires.
+```
+
+If nothing is staged, it tells you to run `git add` first. After the message is shown, it asks before running `git commit -m "<message>"`. The message is passed as a single argument with `spawn`, so no shell quoting or injection is involved. Large diffs are truncated for the request; the file list and the message stay accurate.
+
+## Generate a script: `darija script`
+
+```bash
+darija script "Back up every .env file in this repo into backups/"
+darija script "Prune old Docker images and print the freed space"
+```
+
+The model writes a complete multi-line script for the current OS, the script is printed with syntax highlighting, and it is saved next to you:
+
+- Windows: `generated_script.ps1`
+- macOS and Linux: `generated_script.sh`, with a `#!/usr/bin/env bash` shebang
+
+Existing files are never overwritten: the next name is `generated_script-2.ps1` (and so on). After saving, `darija` shows the risk level and asks before executing the file through PowerShell (`-ExecutionPolicy Bypass -File`) or `bash`. Catastrophic content such as a recursive delete of a drive or system directory is refused and the file is not written at all.
+
+## Run fully local: `--local`
+
+```bash
+darija --local "Show the current Git branch"
+darija --local -m qwen2.5-coder "Write a script that lists large files"
+darija commit --local
+```
+
+`-l, --local` sends every request to a local Ollama server at `http://localhost:11434/v1` instead of OpenAI or Groq. No API key is needed. The default model is `llama3`; pick another with `--model`/`-m` or `OLLAMA_MODEL`, for example `qwen2.5-coder`, `qwen2.5:7b`, or anything you pulled with `ollama pull`. Set `DARIJA_OLLAMA_URL` to use a different host or port, and start the server with `ollama serve`. Local requests default to a 120-second timeout because CPU inference is slower than an API call.
+
+The flag works before or after a subcommand: `darija --local chra7 "git status"` and `darija chra7 "git status" --local` are equivalent.
+
 ## Terminal UI
 
 - An ASCII `DARIJA` banner is printed on start when output is a terminal.
@@ -62,9 +108,12 @@ Open a new PowerShell window after installing. The hook writes `last-error.json`
 ## Features
 
 - Saves an OpenAI (`sk-`) or Groq (`gsk_`) API key with `conf` in the OS user config directory, and falls back to `OPENAI_API_KEY` or `GROQ_API_KEY`. The provider is detected from the key prefix.
+- `--local` routes any request to a local Ollama server with no API key.
 - Detects the operating system and asks the model for a command that fits that shell.
 - Returns structured JSON: `command`, `explanation`, `risk_level`, `requires_confirmation`.
 - Explains the command in the same language as the request.
+- Writes Conventional Commits messages from the staged diff (`darija commit`).
+- Generates, highlights, saves, and optionally runs multi-line scripts (`darija script`).
 - Interactive menu: execute, copy to the clipboard, or cancel.
 - Runs commands that resolve to an executable directly with `spawn` and an argument array, without a shell.
 - On Windows, routes `.cmd`, `.bat`, and `.ps1` shims such as `npm`, `npx`, and `yarn` through PowerShell, because Node cannot launch them without a shell.
@@ -75,8 +124,8 @@ Open a new PowerShell window after installing. The hook writes `last-error.json`
 ## Requirements
 
 - Node.js 18 or newer
-- An OpenAI key (`sk-...`) or a Groq key (`gsk_...`)
-- Git or Docker on `PATH` when you ask for those tools
+- An OpenAI key (`sk-...`), a Groq key (`gsk_...`), or a local Ollama server
+- `git` on `PATH` for `darija commit`, and Git or Docker when you ask for those tools
 
 ## Install
 
@@ -91,6 +140,7 @@ Create these files (they are already in this repository):
 
 - `package.json` — ESM package (`"type": "module"`) and the `darija` bin entry
 - `bin/index.js` — CLI implementation, with a Node shebang
+- `src/` — UI, capture, Git, script, and highlighting helpers
 - `.gitignore`
 - `README.md`
 
@@ -124,12 +174,13 @@ npm install -g .
 
 ## Configure the API key
 
-Both providers speak the OpenAI chat-completions protocol. Save whichever key you have — the prefix selects the provider and endpoint:
+All providers speak the OpenAI chat-completions protocol. Save whichever key you have — the prefix selects the provider and endpoint. Ollama needs no key and is selected with `--local`:
 
 | Key | Provider | Default model | Endpoint |
 | --- | --- | --- | --- |
 | `sk-...` | OpenAI | `gpt-4o-mini` | `api.openai.com/v1` |
 | `gsk_...` | Groq | `openai/gpt-oss-120b` | `api.groq.com/openai/v1` |
+| none, `--local` | Ollama | `llama3` | `localhost:11434/v1` |
 
 The saved key wins over environment variables.
 
@@ -162,13 +213,15 @@ Optional model override:
 # one request
 darija --model gpt-4o-mini "Show the current Git branch"
 darija --model llama-3.3-70b-versatile "Show the current Git branch"
+darija --local --model qwen2.5-coder "Show the current Git branch"
 
 # every request
 export OPENAI_MODEL=gpt-4o-mini
 export GROQ_MODEL=llama-3.3-70b-versatile
+export OLLAMA_MODEL=qwen2.5-coder
 ```
 
-`OPENAI_TIMEOUT_MS` defaults to 30000 and is clamped between 5 and 120 seconds. `DARIJA_BASE_URL` points the client at an OpenAI-compatible proxy instead of the provider default.
+`OPENAI_TIMEOUT_MS` defaults to 30000 and is clamped between 5 and 120 seconds; local Ollama requests use 120 seconds unless you set it. `DARIJA_BASE_URL` points the remote client at an OpenAI-compatible proxy instead of the provider default, and `DARIJA_OLLAMA_URL` changes the local endpoint.
 
 ## Use
 
@@ -208,6 +261,13 @@ Ctrl+C cancels a prompt. During execution it signals the child process, prints `
 
 The key is stored by `conf` as JSON in the user config directory (mode `0600` where the operating system honors it). It is not encrypted, because an encryption key shipped inside the CLI would not be a secret. Do not commit the config file or put a key in the repository.
 
+`commit` and `script` use extra safeguards:
+
+- The commit message is passed to `git commit -m` as one element of an argument array with `shell: false`, so the message is never parsed by a shell.
+- A generated script is written to its own file and then run through `powershell.exe -NoProfile -ExecutionPolicy Bypass -File generated_script.ps1` or `/bin/bash generated_script.sh`. `-ExecutionPolicy Bypass` is required for an unsigned local script that PowerShell would otherwise refuse to load.
+- Scripts whose content matches the catastrophic rules (fork bomb, download-and-execute, disk formatting, recursive delete of a drive or system directory) are shown but not saved and cannot be executed.
+- Generated scripts and commit messages are always displayed before the confirmation prompt. Nothing is executed without an explicit yes.
+
 ## Test the CLI
 
 ```bash
@@ -218,11 +278,14 @@ darija "Chno hiya branch li ana fiha daba?"
 darija "Show all Docker containers"
 darija chra7 "git reset --hard HEAD~1"
 darija 3ta9 "bash: npm: command not found"
+darija --local "Show the current Git branch"
+darija commit
+darija script "Print the ten largest files in this folder"
 ```
 
-Choose **Cancel** the first time if you only want to inspect the generated command. Use a Git repository or a running Docker engine when you execute those examples.
+Choose **Cancel** the first time if you only want to inspect the generated command. Use a Git repository or a running Docker engine when you execute those examples, and run `git add` before trying `darija commit`.
 
-With a Groq key saved, the same commands run against Groq; `darija config` reports `Provider Groq` and the model in use.
+With a Groq key saved, the same commands run against Groq; `darija config` reports `Provider Groq` and the model in use. With `--local`, requests go to Ollama and no key is needed.
 
 ## Project layout
 
@@ -232,7 +295,11 @@ darija-cli/
 │   └── index.js        # commands, prompts, execution, safety checks
 ├── src/
 │   ├── ui.js           # banner, spinner text, risk colours
-│   └── session.js      # last-error capture file and PowerShell hook
+│   ├── session.js      # last-error capture file and PowerShell hook
+│   ├── git.js          # staged diff reader and git runner
+│   ├── script.js       # script file naming, saving, interpreter
+│   ├── highlight.js    # bash and PowerShell syntax highlighting
+│   └── env.js          # child environment without API keys
 ├── package.json
 ├── package-lock.json
 ├── .gitignore
