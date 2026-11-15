@@ -26,6 +26,39 @@ node bin/index.js "Show the current Git branch"
 
 Pick **Execute Command** from the menu to run the generated command, or **Copy to Clipboard** to keep it for later.
 
+## Explain a command: `chra7`
+
+```bash
+darija chra7 "git reset --hard HEAD~1"
+darija chra7 "docker run --rm -it -p 3000:3000 node:20"
+```
+
+The command is broken into its program, flags, arguments, and pipes, and every part is explained in plain Moroccan Darija (Latin script). Nothing is executed.
+
+## Fix the last failure: `3ta9`
+
+```bash
+darija 3ta9                      # reads the last failure captured by the shell hook
+darija 3ta9 "npm ERR! code ENOENT"   # or paste the error text
+```
+
+`3ta9` sends the failing command and its error output to the model, prints a diagnosis in Darija, and proposes exactly one safe fix. The fix goes through the same risk check, confirmation menu, and execution path as a generated command. If the last command succeeded, there is nothing to fix.
+
+Automatic capture needs the shell hook, which reads the last command, its error, and its exit code when the prompt is drawn:
+
+```powershell
+darija hook --install     # appends the hook to your PowerShell profile
+darija hook               # print the snippet instead
+```
+
+Open a new PowerShell window after installing. The hook writes `last-error.json` next to the `darija` config file and only stores a failure when the last command failed. On macOS and Linux the hook is PowerShell-only; use the inline form, `darija 3ta9 "…error…"`.
+
+## Terminal UI
+
+- An ASCII `DARIJA` banner is printed on start when output is a terminal.
+- While the model works, a spinner shows `AI kayfker... 🧠`.
+- Risk levels are colour-coded: 🟢 green `LOW`/safe, 🟡 yellow `MEDIUM`, 🔴 red `HIGH`/dangerous.
+
 ## Features
 
 - Saves an OpenAI (`sk-`) or Groq (`gsk_`) API key with `conf` in the OS user config directory, and falls back to `OPENAI_API_KEY` or `GROQ_API_KEY`. The provider is detected from the key prefix.
@@ -183,6 +216,8 @@ darija config
 darija "Show the current Git branch"
 darija "Chno hiya branch li ana fiha daba?"
 darija "Show all Docker containers"
+darija chra7 "git reset --hard HEAD~1"
+darija 3ta9 "bash: npm: command not found"
 ```
 
 Choose **Cancel** the first time if you only want to inspect the generated command. Use a Git repository or a running Docker engine when you execute those examples.
@@ -194,7 +229,10 @@ With a Groq key saved, the same commands run against Groq; `darija config` repor
 ```text
 darija-cli/
 ├── bin/
-│   └── index.js
+│   └── index.js        # commands, prompts, execution, safety checks
+├── src/
+│   ├── ui.js           # banner, spinner text, risk colours
+│   └── session.js      # last-error capture file and PowerShell hook
 ├── package.json
 ├── package-lock.json
 ├── .gitignore

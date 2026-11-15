@@ -7,7 +7,8 @@
     "darija": "./bin/index.js"
   },
   "files": [
-    "bin"
+    "bin",
+    "src"
   ],
   "engines": {
     "node": ">=18"

@@ -14,6 +14,15 @@ import inquirer from 'inquirer';
 import OpenAI from 'openai';
 import ora from 'ora';
 
+import {
+  capturePathFor,
+  installHook,
+  powerShellHook,
+  powerShellProfilePath,
+  readCapture,
+} from '../src/session.js';
+import { printBanner, riskLabel, SPINNER_TEXT } from '../src/ui.js';
+
 const packageJson = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 );
@@ -58,6 +67,56 @@ const RESPONSE_FORMAT = {
         requires_confirmation: { type: 'boolean' },
       },
       required: ['command', 'explanation', 'risk_level', 'requires_confirmation'],
+    },
+  },
+};
+
+const EXPLAIN_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'command_explanation',
+    description: 'A line-by-line explanation of one shell command in Moroccan Darija.',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        overview: { type: 'string' },
+        lines: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              code: { type: 'string' },
+              explanation: { type: 'string' },
+            },
+            required: ['code', 'explanation'],
+          },
+        },
+      },
+      required: ['overview', 'lines'],
+    },
+  },
+};
+
+const FIX_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'command_fix',
+    description: 'A Darija diagnosis and one safe fix command for a failed shell command.',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        diagnosis: { type: 'string' },
+        command: { type: 'string' },
+        explanation: { type: 'string' },
+        risk_level: { type: 'string', enum: ['low', 'medium', 'high'] },
+        requires_confirmation: { type: 'boolean' },
+      },
+      required: ['diagnosis', 'command', 'explanation', 'risk_level', 'requires_confirmation'],
     },
   },
 };
@@ -333,6 +392,32 @@ function systemPrompt(profile) {
     'Local administration of this computer, including inspecting git or stopping a local process the user owns, is in scope.',
     'Never include an API key, token, or secret in the command or the explanation.',
     'Respond with one JSON object that has command, explanation, risk_level, and requires_confirmation.',
+  ].join('\n');
+}
+
+function explainPrompt(profile) {
+  return [
+    'You explain terminal commands to a Moroccan developer.',
+    'Write every explanation in plain Moroccan Darija using Latin script (Arabizi), keeping technical terms and code fragments as they are.',
+    `The commands run on ${profile.osName} in ${profile.shell}.`,
+    'Split the command into meaningful segments: the program, each flag, each argument, pipes, redirects, and chained commands.',
+    'For each segment, give the exact code fragment and one short Darija sentence describing what it does.',
+    'Write the overview in one or two short Darija sentences.',
+    'Never suggest running anything, never add markdown, and never invent flags that are not in the command.',
+    'Respond with one JSON object that has overview and lines, where each line has code and explanation.',
+  ].join('\n');
+}
+
+function fixPrompt(profile) {
+  return [
+    'You are a senior Moroccan developer helping diagnose a failed terminal command.',
+    'You receive the command, its exit code, the working directory, the shell, and the captured error output.',
+    `The commands run on ${profile.osName} in ${profile.shell}.`,
+    'Explain the most likely cause in plain Moroccan Darija using Latin script (Arabizi), keeping technical terms as they are.',
+    'Propose exactly one safe, non-interactive fix command for the same operating system and shell, or an empty command when no command can fix it.',
+    'Never propose destructive actions, force pushes, recursive deletes, or unrelated chained commands.',
+    'Set risk_level and requires_confirmation exactly as a careful engineer would.',
+    'Respond with one JSON object that has diagnosis, command, explanation, risk_level, and requires_confirmation.',
   ].join('\n');
 }
 
@@ -803,6 +888,17 @@ function extractJson(text) {
   return fenced ? fenced[1].trim() : trimmed;
 }
 
+function readRisk(value) {
+  const risk = typeof value.risk_level === 'string' ? value.risk_level.toLowerCase() : '';
+  if (!['low', 'medium', 'high'].includes(risk)) {
+    throw new ResponseParseError('The model returned an invalid risk_level.');
+  }
+  if (typeof value.requires_confirmation !== 'boolean') {
+    throw new ResponseParseError('The model returned an invalid requires_confirmation value.');
+  }
+  return { risk, requires_confirmation: value.requires_confirmation };
+}
+
 function normalizePayload(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new ResponseParseError('The model response was not a JSON object.');
@@ -811,13 +907,7 @@ function normalizePayload(value) {
   const explanation = typeof value.explanation === 'string'
     ? sanitizeTerminal(value.explanation).replace(/\s+/g, ' ').trim()
     : '';
-  const risk = typeof value.risk_level === 'string' ? value.risk_level.toLowerCase() : '';
-  if (!['low', 'medium', 'high'].includes(risk)) {
-    throw new ResponseParseError('The model returned an invalid risk_level.');
-  }
-  if (typeof value.requires_confirmation !== 'boolean') {
-    throw new ResponseParseError('The model returned an invalid requires_confirmation value.');
-  }
+  const { risk, requires_confirmation } = readRisk(value);
   if (!explanation) throw new ResponseParseError('The model omitted the explanation.');
   if (explanation.length > 1200) throw new ResponseParseError('The explanation was too long.');
   if (command) {
@@ -828,7 +918,61 @@ function normalizePayload(value) {
     command,
     explanation,
     risk_level: risk,
-    requires_confirmation: value.requires_confirmation,
+    requires_confirmation,
+  };
+}
+
+function normalizeExplanation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ResponseParseError('The model response was not a JSON object.');
+  }
+  const overview = typeof value.overview === 'string'
+    ? sanitizeTerminal(value.overview).replace(/\s+/g, ' ').trim()
+    : '';
+  if (!overview) throw new ResponseParseError('The model omitted the overview.');
+  if (overview.length > 600) throw new ResponseParseError('The overview was too long.');
+  const lines = Array.isArray(value.lines) ? value.lines.slice(0, 15) : [];
+  const parsed = lines
+    .map((line) => ({
+      code: typeof line?.code === 'string' ? sanitizeTerminal(line.code).trim() : '',
+      explanation: typeof line?.explanation === 'string'
+        ? sanitizeTerminal(line.explanation).replace(/\s+/g, ' ').trim()
+        : '',
+    }))
+    .filter((line) => line.code && line.explanation);
+  if (!parsed.length) throw new ResponseParseError('The model returned no explanation lines.');
+  if (parsed.some((line) => line.code.length > 300 || line.explanation.length > 500)) {
+    throw new ResponseParseError('One explanation line was too long.');
+  }
+  return { overview, lines: parsed };
+}
+
+function normalizeFix(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ResponseParseError('The model response was not a JSON object.');
+  }
+  const diagnosis = typeof value.diagnosis === 'string'
+    ? sanitizeTerminal(value.diagnosis).replace(/\s+/g, ' ').trim()
+    : '';
+  if (!diagnosis) throw new ResponseParseError('The model omitted the diagnosis.');
+  if (diagnosis.length > 800) throw new ResponseParseError('The diagnosis was too long.');
+  const command = typeof value.command === 'string' ? value.command.trim() : '';
+  const explanation = typeof value.explanation === 'string'
+    ? sanitizeTerminal(value.explanation).replace(/\s+/g, ' ').trim()
+    : '';
+  const { risk, requires_confirmation } = readRisk(value);
+  if (!explanation) throw new ResponseParseError('The model omitted the explanation.');
+  if (explanation.length > 1200) throw new ResponseParseError('The explanation was too long.');
+  if (command) {
+    const problem = validateCommandString(command);
+    if (problem) throw new ResponseParseError(problem);
+  }
+  return {
+    diagnosis,
+    command,
+    explanation,
+    risk_level: risk,
+    requires_confirmation,
   };
 }
 
@@ -837,26 +981,23 @@ function schemaUnsupported(error) {
   return /response_format|json_schema|structured/i.test(String(error.message ?? ''));
 }
 
-async function requestCompletion(client, model, messages, responseFormat) {
+const RETRY_HINT = 'The previous response was invalid. Return only one valid JSON object that matches the requested fields.';
+
+async function requestCompletion(client, model, messages, responseFormat, normalize, maxTokens = 700) {
   const completion = await client.chat.completions.create({
     model,
     temperature: 0,
-    max_tokens: 700,
+    max_tokens: maxTokens,
     messages,
     response_format: responseFormat,
   });
   const message = completion.choices?.[0]?.message;
   if (message?.refusal) {
-    return {
-      command: '',
-      explanation: String(message.refusal).trim(),
-      risk_level: 'low',
-      requires_confirmation: false,
-    };
+    throw new Error(String(message.refusal).trim() || 'The model refused the request.');
   }
   if (!message?.content) throw new ResponseParseError('The model returned an empty response.');
   try {
-    return normalizePayload(JSON.parse(extractJson(message.content)));
+    return normalize(JSON.parse(extractJson(message.content)));
   } catch (error) {
     if (error instanceof ResponseParseError) throw error;
     if (error instanceof SyntaxError) throw new ResponseParseError('The model returned malformed JSON.');
@@ -864,13 +1005,40 @@ async function requestCompletion(client, model, messages, responseFormat) {
   }
 }
 
-async function generateCommand(query, apiKey, profile, model, provider) {
-  const client = new OpenAI({
+async function requestStructured(client, model, messages, { responseFormat, normalize, maxTokens = 700 }) {
+  let format = responseFormat;
+  let conversation = messages;
+  let hinted = false;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await requestCompletion(client, model, conversation, format, normalize, maxTokens);
+    } catch (error) {
+      if (format.type === 'json_schema' && schemaUnsupported(error)) {
+        format = { type: 'json_object' };
+        continue;
+      }
+      if (error?.isParseError && !hinted) {
+        hinted = true;
+        conversation = [...conversation, { role: 'user', content: RETRY_HINT }];
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new ResponseParseError('The model could not produce a valid response.');
+}
+
+function createClient(apiKey, provider) {
+  return new OpenAI({
     apiKey,
     baseURL: process.env.DARIJA_BASE_URL?.trim() || provider.baseURL,
     timeout: API_TIMEOUT_MS,
     maxRetries: 0,
   });
+}
+
+async function generateCommand(query, apiKey, profile, model, provider) {
   const messages = [
     { role: 'system', content: systemPrompt(profile) },
     {
@@ -878,29 +1046,46 @@ async function generateCommand(query, apiKey, profile, model, provider) {
       content: `Operating system: ${profile.osName}\nShell: ${profile.shell}\nRequest: ${query}`,
     },
   ];
-  let responseFormat = RESPONSE_FORMAT;
-  let hinted = false;
+  return requestStructured(createClient(apiKey, provider), model, messages, {
+    responseFormat: RESPONSE_FORMAT,
+    normalize: normalizePayload,
+    maxTokens: 700,
+  });
+}
 
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      return await requestCompletion(client, model, messages, responseFormat);
-    } catch (error) {
-      if (responseFormat.type === 'json_schema' && schemaUnsupported(error)) {
-        responseFormat = { type: 'json_object' };
-        continue;
-      }
-      if (error?.isParseError && !hinted) {
-        hinted = true;
-        messages.push({
-          role: 'user',
-          content: 'The previous response was invalid. Return one JSON object with command, explanation, risk_level, and requires_confirmation.',
-        });
-        continue;
-      }
-      throw error;
-    }
-  }
-  throw new ResponseParseError('The model could not produce a valid command.');
+async function explainCommand(command, apiKey, profile, model, provider) {
+  const messages = [
+    { role: 'system', content: explainPrompt(profile) },
+    { role: 'user', content: `Command: ${command}` },
+  ];
+  return requestStructured(createClient(apiKey, provider), model, messages, {
+    responseFormat: EXPLAIN_FORMAT,
+    normalize: normalizeExplanation,
+    maxTokens: 900,
+  });
+}
+
+async function suggestFix(captured, apiKey, profile, model, provider) {
+  const errorText = captured.error ? sanitizeTerminal(captured.error) : '(no error output was captured)';
+  const messages = [
+    { role: 'system', content: fixPrompt(profile) },
+    {
+      role: 'user',
+      content: [
+        `Command: ${captured.command || '(unknown)'}`,
+        `Exit code: ${captured.exitCode ?? 'unknown'}`,
+        `Working directory: ${captured.cwd || '(unknown)'}`,
+        `Shell: ${captured.shell}`,
+        'Error output:',
+        errorText,
+      ].join('\n'),
+    },
+  ];
+  return requestStructured(createClient(apiKey, provider), model, messages, {
+    responseFormat: FIX_FORMAT,
+    normalize: normalizeFix,
+    maxTokens: 900,
+  });
 }
 
 function formatApiError(error, apiKey, provider) {
@@ -925,12 +1110,6 @@ function formatApiError(error, apiKey, provider) {
   return sanitizeTerminal(redact(error?.message || `The ${label} request failed.`, apiKey));
 }
 
-function riskPaint(level) {
-  if (level === 'low') return chalk.green(level);
-  if (level === 'medium') return chalk.yellow(level);
-  return chalk.red(level);
-}
-
 function printProposal(payload, verdict, plan, profile, model, providerLabel) {
   console.log('');
   console.log(chalk.bold('Command'));
@@ -940,7 +1119,7 @@ function printProposal(payload, verdict, plan, profile, model, providerLabel) {
   console.log(`  ${sanitizeTerminal(payload.explanation)}`);
   console.log('');
   console.log(chalk.bold('Risk'));
-  console.log(`  ${riskPaint(verdict.risk_level)} ${chalk.dim(`· ${verdict.reason}`)}`);
+  console.log(`  ${riskLabel(verdict.risk_level)} ${chalk.dim(`· ${verdict.reason}`)}`);
   console.log(chalk.dim(`  ${profile.osName} · ${profile.shell} · ${sanitizeTerminal(providerLabel)} ${sanitizeTerminal(model)}`));
   console.log(chalk.dim(`  ${describePlan(plan)}`));
   if (verdict.blocked) {
@@ -1100,6 +1279,201 @@ async function handleAction(action, payload, verdict, apiKey) {
   process.exitCode = code || 1;
 }
 
+function loadProviderSession() {
+  let resolved;
+  try {
+    resolved = resolveApiKey();
+  } catch (error) {
+    console.error(chalk.red('Could not read the saved configuration.'));
+    console.error(chalk.dim(sanitizeTerminal(redact(error?.message || 'The configuration file may be damaged.'))));
+    console.error(chalk.dim('Fix or remove the file, run darija config --key <API_KEY>, or set OPENAI_API_KEY or GROQ_API_KEY.'));
+    process.exitCode = 1;
+    return null;
+  }
+  if (!resolved) {
+    console.error(chalk.red('No API key is configured.'));
+    console.error(chalk.dim('Save one with darija config --key <API_KEY>, or set OPENAI_API_KEY or GROQ_API_KEY.'));
+    process.exitCode = 1;
+    return null;
+  }
+  return { resolved, provider: PROVIDERS[resolved.provider] ?? PROVIDERS.openai };
+}
+
+function selectedModel(provider, options = {}) {
+  return options.model || process.env[provider.modelEnv]?.trim() || provider.defaultModel;
+}
+
+function printExplanation(command, result, providerLabel, model) {
+  console.log('');
+  console.log(chalk.bold('Command'));
+  console.log(chalk.cyan(`  ${sanitizeTerminal(command)}`));
+  console.log('');
+  console.log(chalk.bold('Chra7 b darija'));
+  console.log(`  ${result.overview}`);
+  console.log('');
+  for (const line of result.lines) {
+    console.log(`  ${chalk.cyan(line.code)}`);
+    console.log(`    ${chalk.dim('↳')} ${line.explanation}`);
+  }
+  console.log(chalk.dim(`\n  ${providerLabel} ${sanitizeTerminal(model)}`));
+}
+
+function printDiagnosis(captured, result, providerLabel, model) {
+  console.log('');
+  if (captured.command) {
+    console.log(chalk.bold('Last command'));
+    console.log(chalk.cyan(`  ${sanitizeTerminal(captured.command)}`));
+    console.log('');
+  }
+  if (captured.error) {
+    const preview = sanitizeTerminal(captured.error).split('\n').slice(0, 12);
+    console.log(chalk.bold('Error'));
+    console.log(chalk.dim(preview.map((line) => `  ${line}`).join('\n')));
+    console.log('');
+  }
+  console.log(chalk.bold('Tachkhis b darija'));
+  console.log(`  ${result.diagnosis}`);
+  console.log(chalk.dim(`  ${providerLabel} ${sanitizeTerminal(model)}`));
+  if (!result.command) {
+    console.log(chalk.yellow('\nMa l9itch commande dyal l-fix.'));
+  }
+}
+
+async function runExplain(parts) {
+  const command = parts.join(' ').trim();
+  if (!command) {
+    console.error(chalk.red('Give me a command to explain, for example: darija chra7 "git reset --hard"'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const profile = environmentProfile();
+  if (!profile) {
+    console.error(chalk.red(`Unsupported operating system: ${os.platform()}. darija supports Windows, Linux, and macOS.`));
+    process.exitCode = 1;
+    return;
+  }
+
+  const problem = validateCommandString(command);
+  if (problem) {
+    console.error(chalk.red(problem));
+    process.exitCode = 1;
+    return;
+  }
+
+  const session = loadProviderSession();
+  if (!session) return;
+  const { resolved, provider } = session;
+  const model = selectedModel(provider);
+
+  printBanner();
+  console.log(chalk.bold.cyan('darija chra7') + chalk.dim(`  ${profile.osName} · ${profile.shell} · ${provider.label}`));
+  const spinner = ora({ text: SPINNER_TEXT, color: 'cyan' }).start();
+
+  let result;
+  try {
+    result = await explainCommand(command, resolved.key, profile, model, provider);
+    spinner.succeed('Chra7 wajed');
+  } catch (error) {
+    spinner.fail('Could not explain the command');
+    console.error(chalk.red(formatApiError(error, resolved.key, provider)));
+    process.exitCode = 1;
+    return;
+  }
+
+  printExplanation(command, result, provider.label, model);
+}
+
+async function runFix(parts) {
+  const profile = environmentProfile();
+  if (!profile) {
+    console.error(chalk.red(`Unsupported operating system: ${os.platform()}. darija supports Windows, Linux, and macOS.`));
+    process.exitCode = 1;
+    return;
+  }
+
+  const inline = parts.join(' ').trim();
+  const captured = inline
+    ? { command: '', error: inline, exitCode: null, cwd: process.cwd(), shell: profile.shell, capturedAt: null }
+    : readCapture(capturePathFor(getStore().path));
+
+  if (!captured) {
+    console.log(chalk.yellow('Ma3ndich error output dyal commande lakhira.'));
+    console.log(chalk.dim('Install the shell hook once: darija hook --install'));
+    console.log(chalk.dim('Or paste the error: darija 3ta9 "npm ERR! ..."'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const session = loadProviderSession();
+  if (!session) return;
+  const { resolved, provider } = session;
+  const model = selectedModel(provider);
+
+  printBanner();
+  console.log(chalk.bold.cyan('darija 3ta9') + chalk.dim(`  ${profile.osName} · ${profile.shell} · ${provider.label}`));
+  const spinner = ora({ text: SPINNER_TEXT, color: 'cyan' }).start();
+
+  let result;
+  try {
+    result = await suggestFix(captured, resolved.key, profile, model, provider);
+    spinner.succeed('Tachkhis wajed');
+  } catch (error) {
+    spinner.fail('Could not diagnose the failure');
+    console.error(chalk.red(formatApiError(error, resolved.key, provider)));
+    process.exitCode = 1;
+    return;
+  }
+
+  printDiagnosis(captured, result, provider.label, model);
+  if (!result.command) return;
+
+  const verdict = classifyCommand(result.command, result);
+  if (!verdict.ok) {
+    console.error(chalk.red(verdict.problem));
+    process.exitCode = 1;
+    return;
+  }
+  printProposal(result, verdict, executionPlan(result.command, profile.platform), profile, model, provider.label);
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(chalk.yellow('\nAn interactive terminal is required before anything can run. Nothing was executed.'));
+    return;
+  }
+
+  const action = await promptAction(verdict);
+  await handleAction(action, result, verdict, resolved.key);
+}
+
+async function runHook(options) {
+  const capturePath = capturePathFor(getStore().path);
+  if (process.platform !== 'win32') {
+    console.log(chalk.yellow('Automatic capture is implemented for Windows PowerShell.'));
+    console.log(chalk.dim('On macOS or Linux, paste the error instead: darija 3ta9 "error text"'));
+    return;
+  }
+
+  if (!options.install) {
+    console.log(chalk.bold('Add this block to your PowerShell profile') + chalk.dim(' (notepad $PROFILE):'));
+    console.log('');
+    console.log(powerShellHook(capturePath));
+    console.log('');
+    console.log(chalk.dim('Or install it automatically: darija hook --install'));
+    console.log(chalk.dim(`Captured state file: ${capturePath}`));
+    return;
+  }
+
+  try {
+    const profilePath = await powerShellProfilePath(powershellExecutable());
+    installHook(profilePath, capturePath);
+    console.log(chalk.green(`Hook installed in ${sanitizeTerminal(profilePath)}.`));
+    console.log(chalk.dim('Restart PowerShell or run: . $PROFILE'));
+  } catch (error) {
+    console.error(chalk.red(sanitizeTerminal(error?.message || 'Could not install the hook.')));
+    process.exitCode = 1;
+  }
+}
+
 async function runQuery(words, options) {
   const query = words.join(' ').trim();
   if (!query) {
@@ -1114,27 +1488,14 @@ async function runQuery(words, options) {
     return;
   }
 
-  let resolved;
-  try {
-    resolved = resolveApiKey();
-  } catch (error) {
-    console.error(chalk.red('Could not read the saved configuration.'));
-    console.error(chalk.dim(sanitizeTerminal(redact(error?.message || 'The configuration file may be damaged.'))));
-    console.error(chalk.dim('Fix or remove the file, run darija config --key <API_KEY>, or set OPENAI_API_KEY or GROQ_API_KEY.'));
-    process.exitCode = 1;
-    return;
-  }
-  if (!resolved) {
-    console.error(chalk.red('No API key is configured.'));
-    console.error(chalk.dim('Save one with darija config --key <API_KEY>, or set OPENAI_API_KEY or GROQ_API_KEY.'));
-    process.exitCode = 1;
-    return;
-  }
+  const session = loadProviderSession();
+  if (!session) return;
+  const { resolved, provider } = session;
+  const model = selectedModel(provider, options);
 
-  const provider = PROVIDERS[resolved.provider] ?? PROVIDERS.openai;
-  const model = options.model || process.env[provider.modelEnv]?.trim() || provider.defaultModel;
+  printBanner();
   console.log(chalk.bold.cyan('darija') + chalk.dim(`  ${profile.osName} · ${profile.shell} · ${provider.label}`));
-  const spinner = ora({ text: 'Translating your request into a command...', color: 'cyan' }).start();
+  const spinner = ora({ text: SPINNER_TEXT, color: 'cyan' }).start();
 
   let payload;
   try {
@@ -1256,10 +1617,11 @@ program
 Examples:
   darija config --key sk-...   (OpenAI)
   darija config --key gsk_...  (Groq)
-  darija "Create a new Git branch called feature/auth"
   darija "Chno hiya branch li ana fiha daba?"
-  darija "Show all Docker containers"
-  darija "Supprimer les branches Git locales fusionnées"
+  darija "Create a new Git branch called feature/auth"
+  darija chra7 "git reset --hard HEAD~1"
+  darija 3ta9
+  darija hook --install
 `);
 
 program
@@ -1268,6 +1630,30 @@ program
   .option('-k, --key <apiKey>', 'Save an OpenAI (sk-) or Groq (gsk_) API key in the user config directory')
   .option('--clear', 'Delete the saved API key')
   .action(runConfig);
+
+program
+  .command('chra7')
+  .description('Explain a shell command line by line in Moroccan Darija')
+  .argument('<command...>', 'Command to explain, quoted')
+  .action(async (command) => {
+    await runExplain(command);
+  });
+
+program
+  .command('3ta9')
+  .description('Diagnose the last failed command and propose a safe fix in Darija')
+  .argument('[error...]', 'Error output to diagnose when the shell hook is not installed')
+  .action(async (errorText) => {
+    await runFix(errorText);
+  });
+
+program
+  .command('hook')
+  .description('Print or install the PowerShell hook that lets 3ta9 see the last error')
+  .option('--install', 'Append the hook to your PowerShell profile')
+  .action(async (hookOptions) => {
+    await runHook(hookOptions);
+  });
 
 async function main() {
   const major = Number(process.versions.node.split('.')[0]);
