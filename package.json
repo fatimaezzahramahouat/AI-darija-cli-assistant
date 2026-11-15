@@ -1,0 +1,36 @@
+{
+  "name": "darija-cli",
+  "version": "1.0.0",
+  "description": "AI-powered terminal assistant that turns Moroccan Darija, French, and English into OS-specific shell, Git, and Docker commands.",
+  "type": "module",
+  "bin": {
+    "darija": "./bin/index.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node ./bin/index.js"
+  },
+  "keywords": [
+    "cli",
+    "darija",
+    "shell",
+    "git",
+    "docker",
+    "openai"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "clipboardy": "^4.0.0",
+    "commander": "^12.1.0",
+    "conf": "^13.1.0",
+    "inquirer": "^9.3.7",
+    "openai": "^4.77.0",
+    "ora": "^8.2.0"
+  }
+}
